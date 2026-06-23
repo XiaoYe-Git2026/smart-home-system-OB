@@ -1,0 +1,362 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能家居控制系统</title>
+    <link rel="stylesheet" href="{% static 'dashboard/style.css' %}">
+</head>
+<body>
+    <div class="container">
+        <!-- 标题栏 -->
+        <header class="header">
+            <h1>🏠 智能家居控制系统</h1>
+            <div class="status-bar">
+                <span id="conn-status" class="status offline">● 未连接</span>
+                <span id="update-time" class="update-time">--:--:--</span>
+            </div>
+        </header>
+
+        <!-- 传感器数据卡片 -->
+        <section class="cards">
+            <div class="card sensor">
+                <div class="card-icon">🌡️</div>
+                <div class="card-body">
+                    <div class="card-label">温度</div>
+                    <div class="card-value" id="temp">--</div>
+                    <div class="card-unit">°C</div>
+                </div>
+            </div>
+            <div class="card sensor">
+                <div class="card-icon">☀️</div>
+                <div class="card-body">
+                    <div class="card-label">光照强度</div>
+                    <div class="card-value" id="light">--</div>
+                    <div class="card-unit">Lux</div>
+                </div>
+            </div>
+            <div class="card actuator">
+                <div class="card-icon">🌀</div>
+                <div class="card-body">
+                    <div class="card-label">风扇转速</div>
+                    <div class="card-value" id="fan_speed">--</div>
+                    <div class="card-unit">r/min</div>
+                </div>
+            </div>
+            <div class="card sensor">
+                <div class="card-icon">💡</div>
+                <div class="card-body">
+                    <div class="card-label">LED 灯</div>
+                    <div class="card-value" id="led">--</div>
+                    <div class="card-unit">光照&lt;1000自动亮</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 温度预测面板 -->
+        <section class="predict-panel">
+            <div class="predict-header">
+                <h2>🤖 温度预测 (机器学习)</h2>
+                <div class="predict-actions">
+                    <button class="btn btn-sm" onclick="trainModel()">重新训练</button>
+                    <button class="btn btn-sm" onclick="predictNow()">立即预测</button>
+                </div>
+            </div>
+
+            <div class="predict-cards">
+                <div class="predict-card">
+                    <div class="predict-label">当前温度</div>
+                    <div class="predict-value" id="current-temp">--</div>
+                    <div class="predict-unit">°C</div>
+                </div>
+                <div class="predict-arrow">→</div>
+                <div class="predict-card highlight">
+                    <div class="predict-label">预测温度</div>
+                    <div class="predict-value" id="predicted-temp">--</div>
+                    <div class="predict-unit">°C</div>
+                </div>
+                <div class="predict-card">
+                    <div class="predict-label">建议转速</div>
+                    <div class="predict-value" id="suggest-fan">--</div>
+                    <div class="predict-unit">r/min</div>
+                </div>
+            </div>
+
+            <div id="model-status" class="model-status">模型状态: 未知</div>
+
+            <!-- 自动控制开关 -->
+            <div class="auto-control">
+                <label class="switch-label">
+                    <span>⚡ 自动控制风扇 (根据预测温度)</span>
+                    <label class="switch">
+                        <input type="checkbox" id="auto-toggle" onchange="toggleAutoControl()">
+                        <span class="slider-toggle"></span>
+                    </label>
+                </label>
+                <div id="auto-status" class="auto-status">已关闭</div>
+            </div>
+        </section>
+
+        <!-- 温度趋势图 -->
+        <section class="chart-panel">
+            <h2>📈 温度趋势</h2>
+            <canvas id="temp-chart" height="200"></canvas>
+        </section>
+
+        <!-- 控制面板 -->
+        <section class="control-panel">
+            <h2>🎛️ 手动控制</h2>
+
+            <div class="control-group">
+                <label>风扇档位</label>
+                <div class="fan-buttons">
+                    <button class="fan-btn off fan-speed-btn" onclick="setFan(0)">关闭</button>
+                    <button class="fan-btn fan-speed-btn" onclick="setFan(250)">1/4</button>
+                    <button class="fan-btn fan-speed-btn" onclick="setFan(500)">2/4</button>
+                    <button class="fan-btn fan-speed-btn" onclick="setFan(750)">3/4</button>
+                    <button class="fan-btn max fan-speed-btn" onclick="setFan(1000)">100%</button>
+                </div>
+            </div>
+
+            <!-- LED 由光照传感器自动控制，无需手动操作 -->
+        </section>
+
+        <!-- 消息提示 -->
+        <div id="toast" class="toast hidden"></div>
+    </div>
+
+    <script>
+        const POLL_INTERVAL = {{ poll_interval }} * 1000;
+        let tempHistory = [];
+        const MAX_HISTORY = 60;
+
+        // ==================== 风扇档位 ====================
+        const FAN_LEVELS = [0, 250, 500, 750, 1000];
+        let _lastFanReq = 0;
+        let _fanCooldown = 0;  // 冷却期：控制后不被轮询覆盖
+
+        function setFan(speed) {
+            highlightFanBtn(speed);
+            _fanCooldown = Date.now();
+            const reqId = ++_lastFanReq;
+            fetch('/api/control/', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({property: 'fan_speed', value: speed}),
+            })
+            .then(r => r.json())
+            .then(json => {
+                showToast(json.message, json.success ? 'success' : 'error');
+                if (reqId === _lastFanReq && !json.success) pollSensorData();
+            })
+            .catch(err => {
+                showToast('请求失败: ' + err.message, 'error');
+                if (reqId === _lastFanReq) pollSensorData();
+            });
+        }
+
+        function highlightFanBtn(speed) {
+            document.querySelectorAll('.fan-speed-btn').forEach((btn, i) => {
+                btn.classList.toggle('active', FAN_LEVELS[i] === speed);
+            });
+        }
+
+        // ==================== 窗帘档位 ====================
+        // ==================== LED 状态显示 ====================
+        function updateLedStatus(led) {
+            const el = document.getElementById('led');
+            if (led) {
+                el.textContent = '亮';
+                el.style.color = '#ff9800';
+            } else {
+                el.textContent = '灭';
+                el.style.color = '#999';
+            }
+        }
+
+        // ==================== 轮询传感器 ====================
+        function pollSensorData() {
+            fetch('/api/sensor-data/')
+                .then(resp => resp.json())
+                .then(json => {
+                    if (json.success) {
+                        const d = json.data;
+                        document.getElementById('temp').textContent = d.temp ?? '--';
+                        document.getElementById('light').textContent = d.light ?? '--';
+                        document.getElementById('fan_speed').textContent = d.fan_speed ?? '--';
+                        updateLedStatus(d.led);
+
+                        // 记录温度历史
+                        if (d.temp !== undefined) {
+                            tempHistory.push({t: new Date(), v: d.temp});
+                            if (tempHistory.length > MAX_HISTORY) tempHistory.shift();
+                            drawChart();
+                        }
+
+                        // 同步风扇档位高亮（冷却期内不覆盖用户手动操作）
+                        if (d.fan_speed !== undefined && Date.now() - _fanCooldown > 10000) {
+                            highlightFanBtn(d.fan_speed);
+                        }
+
+                        setConnected(true);
+                    } else {
+                        setConnected(false);
+                    }
+                    updateTime();
+                })
+                .catch(() => setConnected(false));
+        }
+
+        // ==================== 预测 ====================
+        function predictNow() {
+            fetch('/api/predict/')
+                .then(r => r.json())
+                .then(json => {
+                    if (json.success) {
+                        const d = json.data;
+                        document.getElementById('current-temp').textContent = d.current_temp ?? '--';
+                        document.getElementById('predicted-temp').textContent = d.predicted_temp ?? '--';
+                        document.getElementById('suggest-fan').textContent = d.fan_speed ?? '--';
+                        document.getElementById('model-status').textContent =
+                            '模型状态: ' + (d.model_ready ? '✅ 已就绪' : '⏳ ' + d.message);
+                    }
+                });
+        }
+
+        function trainModel() {
+            showToast('正在训练模型...', 'success');
+            fetch('/api/train/', {method: 'POST'})
+                .then(r => r.json())
+                .then(json => {
+                    showToast(json.message, json.success ? 'success' : 'error');
+                    if (json.success) predictNow();
+                });
+        }
+
+        // ==================== 自动控制 ====================
+        function toggleAutoControl() {
+            const enabled = document.getElementById('auto-toggle').checked;
+            fetch('/api/auto-control/', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({enabled: enabled}),
+            })
+            .then(r => r.json())
+            .then(json => {
+                showToast(json.message, 'success');
+                document.getElementById('auto-status').textContent =
+                    enabled ? '🟢 运行中 — 根据预测温度自动调节风扇' : '已关闭';
+            });
+        }
+
+        function pollAutoStatus() {
+            fetch('/api/auto-control/status/')
+                .then(r => r.json())
+                .then(json => {
+                    if (json.enabled && json.prediction) {
+                        const p = json.prediction;
+                        document.getElementById('current-temp').textContent = p.current_temp ?? '--';
+                        document.getElementById('predicted-temp').textContent = p.predicted_temp ?? '--';
+                        document.getElementById('suggest-fan').textContent = p.fan_speed ?? '--';
+                        // 自动控制后刷新传感器数据
+                        setTimeout(pollSensorData, 500);
+                    }
+                });
+        }
+
+        // ==================== 温度趋势图 ====================
+        function drawChart() {
+            const canvas = document.getElementById('temp-chart');
+            const ctx = canvas.getContext('2d');
+            const W = canvas.width = canvas.offsetWidth;
+            const H = canvas.height = 200;
+
+            ctx.clearRect(0, 0, W, H);
+
+            if (tempHistory.length < 2) {
+                ctx.fillStyle = '#999';
+                ctx.font = '14px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.fillText('等待数据...', W / 2, H / 2);
+                return;
+            }
+
+            const values = tempHistory.map(h => h.v);
+            const minV = Math.floor(Math.min(...values) - 1);
+            const maxV = Math.ceil(Math.max(...values) + 1);
+            const range = maxV - minV || 1;
+
+            const padL = 45, padR = 15, padT = 10, padB = 25;
+            const cW = W - padL - padR;
+            const cH = H - padT - padB;
+
+            // 网格
+            ctx.strokeStyle = '#e8e8e8';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 4; i++) {
+                const y = padT + cH * i / 4;
+                ctx.beginPath();
+                ctx.moveTo(padL, y);
+                ctx.lineTo(W - padR, y);
+                ctx.stroke();
+
+                ctx.fillStyle = '#999';
+                ctx.font = '11px sans-serif';
+                ctx.textAlign = 'right';
+                ctx.fillText((maxV - range * i / 4).toFixed(1), padL - 5, y + 4);
+            }
+
+            // 温度曲线
+            ctx.beginPath();
+            ctx.strokeStyle = '#667eea';
+            ctx.lineWidth = 2;
+            for (let i = 0; i < tempHistory.length; i++) {
+                const x = padL + (i / (tempHistory.length - 1)) * cW;
+                const y = padT + (1 - (tempHistory[i].v - minV) / range) * cH;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+
+            // 填充
+            const lastX = padL + cW;
+            const lastY = padT + (1 - (tempHistory[tempHistory.length - 1].v - minV) / range) * cH;
+            ctx.lineTo(lastX, padT + cH);
+            ctx.lineTo(padL, padT + cH);
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(102,126,234,0.1)';
+            ctx.fill();
+        }
+
+        // ==================== 工具函数 ====================
+        function setConnected(ok) {
+            const el = document.getElementById('conn-status');
+            el.textContent = ok ? '● 已连接' : '● 未连接';
+            el.className = 'status ' + (ok ? 'online' : 'offline');
+        }
+
+        function updateTime() {
+            document.getElementById('update-time').textContent =
+                new Date().toLocaleTimeString('zh-CN', {hour12: false});
+        }
+
+        function showToast(msg, type) {
+            const el = document.getElementById('toast');
+            el.textContent = msg;
+            el.className = 'toast ' + type;
+            setTimeout(() => el.className = 'toast hidden', 3000);
+        }
+
+        // ==================== 启动 ====================
+        pollSensorData();
+        setInterval(pollSensorData, POLL_INTERVAL);
+
+        // 每轮询后自动预测
+        setInterval(() => {
+            predictNow();
+            pollAutoStatus();
+        }, POLL_INTERVAL * 2);
+    </script>
+</body>
+</html>
